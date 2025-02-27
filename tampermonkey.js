@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Universal WebRTC Stats Logger
+// @name         Improved Universal WebRTC Stats Logger v0.3
 // @namespace    http://tampermonkey.net/
-// @version      0.1
-// @description  Log all WebRTC connections and send stats to a server
+// @version      0.3
+// @description  Log all WebRTC connections and send comprehensive stats to a server
 // @author       You
 // @match        *://*/*
 // @grant        none
@@ -20,7 +20,7 @@
         statsInterval: 1000,
 
         // How often to send batched logs to server (in milliseconds)
-        sendInterval: 2000,
+        sendInterval: 1000,
 
         // Maximum number of logs to keep in memory before forced sending
         maxLogsBeforeSend: 1000,
@@ -28,11 +28,14 @@
         // Whether to log to console as well
         logToConsole: true,
 
-        // Log additional details about tracks, codecs, etc.
-        detailedLogs: true,
+        // Always include raw stats (required for the Python analyzer)
+        includeRawStats: true,
 
         // User identifier (optional - set to null to disable)
-        userId: null
+        userId: null,
+
+        // Debug mode - adds additional console logging
+        debugMode: false
     };
 
     // Store for all active peer connections
@@ -45,7 +48,7 @@
     let statsIntervalId = null;
     let sendIntervalId = null;
 
-    // Session identifier
+    // Session identifier (based on the session's start time)
     const sessionId = generateSessionId();
 
     // Initialize when the page loads
@@ -121,7 +124,7 @@
             // Log when ICE candidates are added
             const originalAddIceCandidate = pc.addIceCandidate;
             pc.addIceCandidate = function(candidate) {
-                if (CONFIG.detailedLogs && candidate) {
+                if (candidate) {
                     const candidateLog = {
                         type: 'ice_candidate',
                         pcId: pcId,
@@ -189,46 +192,15 @@
             try {
                 const stats = await connection.pc.getStats();
                 const statsObj = {};
-                const processedStats = {
-                    inbound: {},
-                    outbound: {},
-                    candidates: {},
-                    codec: {},
-                    certificates: {},
-                    track: {},
-                    mediaSource: {},
-                    transport: {},
-                    sctpTransport: {}
-                };
 
-                // Process and categorize stats
+                // Process and categorize stats - preserve all original properties
                 stats.forEach(stat => {
+                    // Store the complete raw stat object without modification
                     statsObj[stat.id] = stat;
-
-                    // Categorize stats by type
-                    if (stat.type.includes('inbound')) {
-                        processedStats.inbound[stat.id] = stat;
-                    } else if (stat.type.includes('outbound')) {
-                        processedStats.outbound[stat.id] = stat;
-                    } else if (stat.type.includes('candidate')) {
-                        processedStats.candidates[stat.id] = stat;
-                    } else if (stat.type === 'codec') {
-                        processedStats.codec[stat.id] = stat;
-                    } else if (stat.type === 'certificate') {
-                        processedStats.certificates[stat.id] = stat;
-                    } else if (stat.type === 'track') {
-                        processedStats.track[stat.id] = stat;
-                    } else if (stat.type === 'media-source') {
-                        processedStats.mediaSource[stat.id] = stat;
-                    } else if (stat.type === 'transport') {
-                        processedStats.transport[stat.id] = stat;
-                    } else if (stat.type === 'sctp-transport') {
-                        processedStats.sctpTransport[stat.id] = stat;
-                    }
                 });
 
-                // Extract useful aggregate metrics
-                const metrics = extractMetrics(processedStats);
+                // Extract high-level metrics
+                const metrics = extractMetrics(statsObj);
 
                 // Create the stats log
                 const statsLog = {
@@ -240,8 +212,8 @@
                     metrics: metrics
                 };
 
-                // Add detailed stats if configured
-                if (CONFIG.detailedLogs) {
+                // Always include raw stats for further analysis
+                if (CONFIG.includeRawStats) {
                     statsLog.rawStats = statsObj;
                 }
 
@@ -254,8 +226,8 @@
         }
     }
 
-    // Extract key metrics from raw stats
-    function extractMetrics(processedStats) {
+    // Extract key metrics from raw stats for easier reporting
+    function extractMetrics(statsObj) {
         const metrics = {
             audio: {
                 inbound: {},
@@ -269,60 +241,85 @@
             connection: {}
         };
 
-        // Process inbound stats
-        Object.values(processedStats.inbound).forEach(stat => {
-            if (stat.kind === 'audio') {
-                metrics.audio.inbound = {
+        // Find selected candidate pair for RTT information
+        let selectedCandidatePairId = null;
+        Object.values(statsObj).forEach(stat => {
+            if (stat.type === 'transport' && stat.selectedCandidatePairId) {
+                selectedCandidatePairId = stat.selectedCandidatePairId;
+                metrics.transport = {
+                    selectedCandidatePairId: stat.selectedCandidatePairId,
                     bytesReceived: stat.bytesReceived,
-                    packetsReceived: stat.packetsReceived,
-                    packetsLost: stat.packetsLost,
-                    jitter: stat.jitter,
-                    timestamp: stat.timestamp
-                };
-            } else if (stat.kind === 'video') {
-                metrics.video.inbound = {
-                    bytesReceived: stat.bytesReceived,
-                    packetsReceived: stat.packetsReceived,
-                    packetsLost: stat.packetsLost,
-                    framesReceived: stat.framesReceived,
-                    framesDropped: stat.framesDropped,
-                    framesDecoded: stat.framesDecoded,
-                    frameWidth: stat.frameWidth,
-                    frameHeight: stat.frameHeight,
+                    bytesSent: stat.bytesSent,
                     timestamp: stat.timestamp
                 };
             }
         });
 
-        // Process outbound stats
-        Object.values(processedStats.outbound).forEach(stat => {
-            if (stat.kind === 'audio') {
-                metrics.audio.outbound = {
-                    bytesSent: stat.bytesSent,
-                    packetsSent: stat.packetsSent,
-                    timestamp: stat.timestamp
-                };
-            } else if (stat.kind === 'video') {
-                metrics.video.outbound = {
-                    bytesSent: stat.bytesSent,
-                    packetsSent: stat.packetsSent,
-                    framesSent: stat.framesSent,
-                    frameWidth: stat.frameWidth,
-                    frameHeight: stat.frameHeight,
-                    timestamp: stat.timestamp
-                };
+        // Process inbound and outbound RTP stats
+        Object.values(statsObj).forEach(stat => {
+            if (stat.type === 'inbound-rtp') {
+                if (stat.kind === 'audio') {
+                    metrics.audio.inbound = {
+                        bytesReceived: stat.bytesReceived,
+                        packetsReceived: stat.packetsReceived,
+                        packetsLost: stat.packetsLost,
+                        jitter: stat.jitter,
+                        timestamp: stat.timestamp
+                    };
+                } else if (stat.kind === 'video') {
+                    metrics.video.inbound = {
+                        bytesReceived: stat.bytesReceived,
+                        packetsReceived: stat.packetsReceived,
+                        packetsLost: stat.packetsLost,
+                        framesReceived: stat.framesReceived,
+                        framesDropped: stat.framesDropped,
+                        framesDecoded: stat.framesDecoded,
+                        frameWidth: stat.frameWidth,
+                        frameHeight: stat.frameHeight,
+                        timestamp: stat.timestamp,
+                        // Add the additional video metrics you requested
+                        framesPerSecond: stat.framesPerSecond,
+                        framesDecodedPerSecond: stat.framesDecodedPerSecond || (stat.framesDecoded ? stat.framesDecoded / ((stat.timestamp - (stat._previousTimestamp || 0)) / 1000) : undefined),
+                        framesReceivedPerSecond: stat.framesReceivedPerSecond || (stat.framesReceived ? stat.framesReceived / ((stat.timestamp - (stat._previousTimestamp || 0)) / 1000) : undefined),
+                        totalDecodeTimePerFrame: stat.totalDecodeTime && stat.framesDecoded ? (stat.totalDecodeTime / stat.framesDecoded) * 1000 : undefined // in ms
+                    };
+
+                    // Store timestamp for rate calculations on next interval
+                    stat._previousTimestamp = stat.timestamp;
+                }
+            } else if (stat.type === 'outbound-rtp') {
+                if (stat.kind === 'audio') {
+                    metrics.audio.outbound = {
+                        bytesSent: stat.bytesSent,
+                        packetsSent: stat.packetsSent,
+                        timestamp: stat.timestamp
+                    };
+                } else if (stat.kind === 'video') {
+                    metrics.video.outbound = {
+                        bytesSent: stat.bytesSent,
+                        packetsSent: stat.packetsSent,
+                        framesSent: stat.framesSent,
+                        frameWidth: stat.frameWidth,
+                        frameHeight: stat.frameHeight,
+                        timestamp: stat.timestamp,
+                        // Add additional outbound video metrics
+                        framesPerSecond: stat.framesPerSecond,
+                        framesSentPerSecond: stat.framesSentPerSecond || (stat.framesSent ? stat.framesSent / ((stat.timestamp - (stat._previousTimestamp || 0)) / 1000) : undefined)
+                    };
+
+                    // Store timestamp for rate calculations on next interval
+                    stat._previousTimestamp = stat.timestamp;
+                }
             }
         });
 
-        // Transport stats
-        Object.values(processedStats.transport).forEach(stat => {
-            metrics.transport = {
-                selectedCandidatePairId: stat.selectedCandidatePairId,
-                bytesReceived: stat.bytesReceived,
-                bytesSent: stat.bytesSent,
-                timestamp: stat.timestamp
-            };
-        });
+        // Add RTT information from selected candidate pair
+        if (selectedCandidatePairId && statsObj[selectedCandidatePairId]) {
+            const pair = statsObj[selectedCandidatePairId];
+            if (pair.currentRoundTripTime) {
+                metrics.connection.currentRoundTripTime = pair.currentRoundTripTime;
+            }
+        }
 
         return metrics;
     }
@@ -343,8 +340,8 @@
         // Add to pending logs
         pendingLogs.push(data);
 
-        // Log to console if configured
-        if (CONFIG.logToConsole) {
+        // Debug console logging
+        if (CONFIG.logToConsole && CONFIG.debugMode) {
             if (data.type === 'stats') {
                 console.log(`WebRTC Stats for ${data.pcId}:`, data.metrics);
             } else {
@@ -398,10 +395,25 @@
         }
     }
 
-    // Generate a random session ID
+    // Generate a session ID based on the URL and current time in yyyymmdd-hhmmss format
     function generateSessionId() {
-        return 'webrtc_' + Math.random().toString(36).substring(2, 15) +
-               Math.random().toString(36).substring(2, 15);
+        const now = new Date();
+
+        // Format date as yyyymmdd
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+
+        // Format time as hhmmss
+        const hours = String(now.getHours()).padStart(2, '0');
+        const minutes = String(now.getMinutes()).padStart(2, '0');
+        const seconds = String(now.getSeconds()).padStart(2, '0');
+
+        // Get the hostname from the current URL
+        const hostname = window.location.hostname.replace(/\./g, '_');
+
+        // Combine into final format hostname_yyyymmdd-hhmmss
+        return `${hostname}_${year}${month}${day}-${hours}${minutes}${seconds}`;
     }
 
     // Generate a random ID for peer connections
@@ -472,6 +484,12 @@
             statsIntervalId = null;
             sendIntervalId = null;
             return 'WebRTC logging stopped';
+        },
+
+        // Enable/disable debug mode
+        setDebugMode: (enabled) => {
+            CONFIG.debugMode = enabled;
+            return `Debug mode ${enabled ? 'enabled' : 'disabled'}`;
         }
     };
 
